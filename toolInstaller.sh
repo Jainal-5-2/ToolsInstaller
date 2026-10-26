@@ -2,6 +2,8 @@
 # CTF Tool Installer Script (Kali Linux optimized)
 # Installs StegDetect, RsaCtfTool, CyberChef, and supplements Kali's metapackages.
 # Idempotent: re-running skips anything already present.
+#
+# Interactive: press 's' + Enter at any time to skip the current step.
 
 set -e
 
@@ -25,9 +27,63 @@ if [[ $EUID -ne 0 ]]; then
    log_warn "apt operations need sudo; you may be prompted."
 fi
 
-log_info "Updating package lists..."
-sudo apt-get update -y
+# ==========================================
+# Interactive skip machinery
+# ==========================================
+# Each step runs in a background subshell. We poll stdin with `read -t 0.2`.
+# If the user types 's' (case-insensitive), we kill the step's process group.
+# Ctrl-C during a step also aborts that step (and continues the script).
+# Press Ctrl-C twice in a row at a prompt to exit entirely.
 
+STEP_PID=""
+STEP_SKIPPED=0
+
+# Runs a step function in background; returns 0 on success, 1 on failure/skip.
+run_step() {
+    local step_name="$1"
+    local step_fn="$2"
+    STEP_SKIPPED=0
+
+    echo -e "${GREEN}[INFO]${NC} >>> $step_name  (press 's' + Enter to skip)"
+    # Start the step in its own process group so we can kill the whole tree.
+    setsid bash -c "$(declare -f "$step_fn"); $step_fn" &
+    STEP_PID=$!
+
+    # Poll stdin while the step runs.
+    while kill -0 "$STEP_PID" 2>/dev/null; do
+        # Read with timeout; returns non-zero on timeout.
+        if read -r -t 0.2 -n 1 key 2>/dev/null; then
+            # Drain the rest of the line if any (so Enter isn't left buffered).
+            while read -r -t 0 -n 1 _ 2>/dev/null; do :; done
+            if [[ "${key,,}" == "s" ]]; then
+                log_warn "Skip requested ? stopping '$step_name'..."
+                kill -TERM -"$STEP_PID" 2>/dev/null || kill -TERM "$STEP_PID" 2>/dev/null
+                sleep 1
+                kill -KILL -"$STEP_PID" 2>/dev/null || kill -KILL "$STEP_PID" 2>/dev/null
+                wait "$STEP_PID" 2>/dev/null
+                STEP_SKIPPED=1
+                log_warn "Step skipped: $step_name"
+                return 1
+            fi
+        fi
+    done
+
+    # Step finished naturally.
+    wait "$STEP_PID"
+    local rc=$?
+    if [ $rc -ne 0 ]; then
+        log_error "Step failed: $step_name (exit $rc)"
+        return 1
+    fi
+    return 0
+}
+
+# Allow Ctrl-C to skip the current step rather than killing the whole script.
+trap 'log_warn "Ctrl-C caught ? skipping current step..."; [[ -n "$STEP_PID" ]] && kill -TERM -"$STEP_PID" 2>/dev/null' INT
+
+# ==========================================
+# Step implementations
+# ==========================================
 install_apt_packages() {
     local packages=("$@") to_install=()
     for pkg in "${packages[@]}"; do
@@ -41,23 +97,17 @@ install_apt_packages() {
     fi
 }
 
-# ==========================================
-# 0. Kali metapackages (bulk coverage)
-# ==========================================
-# These pull in the tool categories Kali already curates, so we don't
-# hand-pick versions that may drift or conflict.
-log_info "--- Installing Kali metapackages ---"
-install_apt_packages kali-tools-crypto-stego kali-tools-forensics \
-                     kali-tools-reverse-engineering kali-tools-passwords
+step_metapackages() {
+    log_info "--- Kali metapackages ---"
+    install_apt_packages kali-tools-crypto-stego kali-tools-forensics \
+                         kali-tools-reverse-engineering kali-tools-passwords
+}
 
-# ==========================================
-# 1. StegDetect (LikeNmuFF)
-# ==========================================
-log_info "--- StegDetect ---"
-if command -v stegdetect &>/dev/null; then
-    log_info "Already installed: $(command -v stegdetect)"
-else
-    # Dependencies mostly covered by metapackages; add only gaps.
+step_stegdetect() {
+    log_info "--- StegDetect ---"
+    if command -v stegdetect &>/dev/null; then
+        log_info "Already installed: $(command -v stegdetect)"; return 0
+    fi
     install_apt_packages file binutils python3 libimage-exiftool-perl \
                          zbar-tools stegsnow mediainfo sox binwalk steghide ruby wget
     if ! gem list zsteg -i &>/dev/null; then
@@ -66,21 +116,21 @@ else
     fi
     mkdir -p "$INSTALL_DIR"
     [ -d "$INSTALL_DIR/stegdetect" ] || git clone "$STEGDETECT_REPO" "$INSTALL_DIR/stegdetect"
-    cd "$INSTALL_DIR/stegdetect" && git pull --ff-only 2>/dev/null || true
+    cd "$INSTALL_DIR/stegdetect"
+    git pull --ff-only 2>/dev/null || true
     chmod +x stegdetect.sh && sudo ./stegdetect.sh --install
-fi
+}
 
-# ==========================================
-# 2. RsaCtfTool (venv + global wrapper)
-# ==========================================
-log_info "--- RsaCtfTool ---"
-if command -v RsaCtfTool &>/dev/null || [ -f /usr/local/bin/RsaCtfTool ]; then
-    log_info "Already installed."
-else
+step_rsactftool() {
+    log_info "--- RsaCtfTool ---"
+    if command -v RsaCtfTool &>/dev/null || [ -f /usr/local/bin/RsaCtfTool ]; then
+        log_info "Already installed."; return 0
+    fi
     install_apt_packages python3-venv python3-pip libgmp3-dev libmpc-dev
     mkdir -p "$INSTALL_DIR"
     [ -d "$INSTALL_DIR/RsaCtfTool" ] || git clone "$RSACTFTOOL_REPO" "$INSTALL_DIR/RsaCtfTool"
-    cd "$INSTALL_DIR/RsaCtfTool" && git pull --ff-only 2>/dev/null || true
+    cd "$INSTALL_DIR/RsaCtfTool"
+    git pull --ff-only 2>/dev/null || true
     [ -d venv ] || python3 -m venv venv
     source venv/bin/activate && pip install -e . && deactivate
     sudo tee /usr/local/bin/RsaCtfTool >/dev/null <<EOF
@@ -89,94 +139,101 @@ source "$INSTALL_DIR/RsaCtfTool/venv/bin/activate"
 python "$INSTALL_DIR/RsaCtfTool/RsaCtfTool.py" "\$@"
 EOF
     sudo chmod +x /usr/local/bin/RsaCtfTool
-fi
+}
 
-# ==========================================
-# 3. CyberChef (static HTML; no Docker)
-# ==========================================
-log_info "--- CyberChef (static) ---"
-CYBERCHEF_DIR="$INSTALL_DIR/cyberchef"
-CYBERCHEF_HTML="$CYBERCHEF_DIR/CyberChef.html"
-if [ -f "$CYBERCHEF_HTML" ]; then
-    log_info "Already present: $CYBERCHEF_HTML"
-else
-    mkdir -p "$CYBERCHEF_DIR"
-    ZIP_URL=$(curl -s "$CYBERCHEF_API" | grep browser_download_url | grep '\.zip"' | head -1 | cut -d '"' -f 4)
-    if [ -z "$ZIP_URL" ]; then
-        log_error "GitHub API rate-limited or unreachable; set ZIP_URL manually."
-    else
-        wget -q "$ZIP_URL" -O /tmp/cyberchef.zip
-        unzip -o /tmp/cyberchef.zip -d "$CYBERCHEF_DIR"
-        SRC=$(find "$CYBERCHEF_DIR" -maxdepth 1 -name 'CyberChef_*.html' | head -1)
-        [ -n "$SRC" ] && mv "$SRC" "$CYBERCHEF_HTML" && log_info "Saved: $CYBERCHEF_HTML"
-        rm -f /tmp/cyberchef.zip
+step_cyberchef() {
+    log_info "--- CyberChef (static) ---"
+    local dir="$INSTALL_DIR/cyberchef" html="$INSTALL_DIR/cyberchef/CyberChef.html"
+    if [ -f "$html" ]; then
+        log_info "Already present: $html"; return 0
     fi
-fi
+    mkdir -p "$dir"
+    local zip_url
+    zip_url=$(curl -s "$CYBERCHEF_API" | grep browser_download_url | grep '\.zip"' | head -1 | cut -d '"' -f 4)
+    if [ -z "$zip_url" ]; then
+        log_error "GitHub API rate-limited or unreachable."; return 1
+    fi
+    wget -q "$zip_url" -O /tmp/cyberchef.zip
+    unzip -o /tmp/cyberchef.zip -d "$dir"
+    local src
+    src=$(find "$dir" -maxdepth 1 -name 'CyberChef_*.html' | head -1)
+    [ -n "$src" ] && mv "$src" "$html" && log_info "Saved: $html"
+    rm -f /tmp/cyberchef.zip
+}
+
+step_python_gaps() {
+    log_info "--- Python supplements ---"
+    pip3 show volatility3 &>/dev/null || pip3 install --user volatility3
+    pip3 show stegoveritas &>/dev/null || pip3 install --user stegoveritas
+    pip3 show cyberchef-py &>/dev/null || pip3 install --user cyberchef-py
+    python3 -c "import pwn" 2>/dev/null || pip3 install --user pwntools
+    python3 -c "import Crypto" 2>/dev/null || pip3 install --user pycryptodome
+    python3 -c "import z3" 2>/dev/null || pip3 install --user z3-solver
+}
+
+step_apt_gaps() {
+    log_info "--- Apt gaps ---"
+    install_apt_packages tshark wireshark default-jre
+    if command -v wireshark &>/dev/null && ! groups "$USER" | grep -qw wireshark; then
+        log_info "Adding $USER to wireshark group..."
+        sudo usermod -aG wireshark "$USER"
+        log_warn "Log out and back in for capture permission to apply."
+    fi
+}
+
+step_gui_downloads() {
+    log_info "--- GUI downloads ---"
+    mkdir -p "$INSTALL_DIR"
+    local jar="$INSTALL_DIR/stegsolve.jar" gdir="$INSTALL_DIR/ghidra"
+    if [ ! -f "$jar" ]; then
+        wget -q -O "$jar" \
+          "https://github.com/zardus/ctf-tools/raw/master/stegsolve/stegsolve.jar" \
+          || log_warn "StegSolve download failed."
+    fi
+    if [ ! -d "$gdir" ]; then
+        local url
+        url=$(curl -s https://api.github.com/repos/NationalSecurityAgency/ghidra/releases/latest \
+            | grep browser_download_url | grep '\.zip"' | head -1 | cut -d '"' -f 4)
+        if [ -n "$url" ]; then
+            wget -q "$url" -O /tmp/ghidra.zip
+            mkdir -p "$gdir"
+            unzip -o /tmp/ghidra.zip -d "$gdir" --strip-components=1 2>/dev/null || \
+                unzip -o /tmp/ghidra.zip -d "$gdir"
+            rm -f /tmp/ghidra.zip
+            chmod +x "$gdir/ghidraRun" 2>/dev/null || true
+        fi
+    fi
+}
 
 # ==========================================
-# 4. Kali's Python tooling gaps
+# Main
 # ==========================================
-# Kali ships many of these; install only if the import/command is missing.
-log_info "--- Python supplements ---"
-pip3 show volatility3 &>/dev/null || pip3 install --user volatility3
-pip3 show stegoveritas &>/dev/null || pip3 install --user stegoveritas
-pip3 show cyberchef-py &>/dev/null || pip3 install --user cyberchef-py
-# pwntools/pycryptodome/z3 are in kali-tools-*; only add if import fails.
-python3 -c "import pwn" 2>/dev/null || pip3 install --user pwntools
-python3 -c "import Crypto" 2>/dev/null || pip3 install --user pycryptodome
-python3 -c "import z3" 2>/dev/null || pip3 install --user z3-solver
+log_info "Updating package lists..."
+sudo apt-get update -y
 
-# ==========================================
-# 5. Remaining apt gaps (metapackages cover most)
-# ==========================================
-log_info "--- Apt gaps ---"
-# tshark/wireshark: Kali's sniffing metapackage may not include the GUI.
-install_apt_packages tshark wireshark
-# Wireshark non-root capture on Kali: the live/install image already sets
-# up the wireshark group for the primary user. Only fix if missing.
-if command -v wireshark &>/dev/null && ! groups "$USER" | grep -qw wireshark; then
-    log_info "Adding $USER to wireshark group..."
-    sudo usermod -aG wireshark "$USER"
-    log_warn "Log out and back in for capture permission to apply."
-fi
-# Java for StegSolve/Ghidra (Kali often has default-jre via other packages).
-install_apt_packages default-jre
+log_info "Tip: type 's' + Enter during any step to skip it. Ctrl-C also skips."
+echo ""
 
-# ==========================================
-# 6. GUI tools downloaded from releases
-# ==========================================
-log_info "--- GUI downloads ---"
+run_step "Kali metapackages" step_metapackages || true
+run_step "StegDetect"       step_stegdetect   || true
+run_step "RsaCtfTool"       step_rsactftool   || true
+run_step "CyberChef"        step_cyberchef    || true
+run_step "Python gaps"      step_python_gaps  || true
+run_step "Apt gaps"         step_apt_gaps     || true
+run_step "GUI downloads"    step_gui_downloads || true
+
+# Summary always runs
+CYBERCHEF_HTML="$INSTALL_DIR/cyberchef/CyberChef.html"
 STEGSOLVE_JAR="$INSTALL_DIR/stegsolve.jar"
-if [ ! -f "$STEGSOLVE_JAR" ]; then
-    wget -q -O "$STEGSOLVE_JAR" \
-      "https://github.com/zardus/ctf-tools/raw/master/stegsolve/stegsolve.jar" \
-      || log_warn "StegSolve download failed."
-fi
-
 GHIDRA_DIR="$INSTALL_DIR/ghidra"
-if [ ! -d "$GHIDRA_DIR" ]; then
-    GHIDRA_URL=$(curl -s https://api.github.com/repos/NationalSecurityAgency/ghidra/releases/latest \
-        | grep browser_download_url | grep '\.zip"' | head -1 | cut -d '"' -f 4)
-    if [ -n "$GHIDRA_URL" ]; then
-        wget -q "$GHIDRA_URL" -O /tmp/ghidra.zip
-        mkdir -p "$GHIDRA_DIR"
-        unzip -o /tmp/ghidra.zip -d "$GHIDRA_DIR" --strip-components=1 2>/dev/null || \
-            unzip -o /tmp/ghidra.zip -d "$GHIDRA_DIR"
-        rm -f /tmp/ghidra.zip
-        chmod +x "$GHIDRA_DIR/ghidraRun" 2>/dev/null || true
-    fi
-fi
 
-# ==========================================
-# Summary
-# ==========================================
 log_info "--- Done ---"
 echo ""
 echo "GUI:"
-echo "  CyberChef:      file://$CYBERCHEF_HTML"
-echo "  StegSolve:      java -jar $STEGSOLVE_JAR"
-echo "  Wireshark:      wireshark"
-echo "  Ghidra:         $GHIDRA_DIR/ghidraRun"
+echo "  CyberChef:        file://$CYBERCHEF_HTML"
+echo "  StegSolve:        java -jar $STEGSOLVE_JAR"
+echo "  Wireshark:        wireshark"
+echo "  Ghidra:           $GHIDRA_DIR/ghidraRun"
 echo "  Sonic Visualiser: sonic-visualiser"
 echo ""
 echo "CLI:"
