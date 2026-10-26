@@ -157,8 +157,6 @@ trap 'log_warn "Ctrl-C caught ? skipping current step..."; [[ -n "$STEP_PID" ]] 
 # ==========================================
 # Verification helper
 # ==========================================
-# print_check KIND TARGET LABEL [HINT]
-# KIND: cmd | file | exe | dir | py
 print_check() {
     local kind="$1" target="$2" label="$3" hint="${4:-}"
     local found=0
@@ -212,6 +210,13 @@ install_apt_packages() {
     fi
 }
 
+step_build_prereqs() {
+    log_info "--- Build prerequisites ---"
+    # Must run before any pip/compile step so native extensions can build.
+    install_apt_packages cmake build-essential pkg-config python3-dev \
+                         libgmp3-dev libmpc-dev
+}
+
 step_metapackages() {
     log_info "--- Kali metapackages ---"
     install_apt_packages kali-tools-crypto-stego kali-tools-forensics \
@@ -223,11 +228,11 @@ step_stegdetect() {
     if command -v stegdetect &>/dev/null; then
         log_info "Already installed: $(command -v stegdetect)"; return 0
     fi
-    # Full dependency set from the LikeNmuFF/stegdetect README,
-    # plus cmake for the JPEG scanner source build.
+    # Full dependency set from the LikeNmuFF/stegdetect README.
+    # cmake is guaranteed by step_build_prereqs.
     install_apt_packages file binutils python3 libimage-exiftool-perl \
                          zbar-tools stegsnow mediainfo sox binwalk steghide ruby wget \
-                         tesseract-ocr ffmpeg poppler-utils unzip cmake
+                         tesseract-ocr ffmpeg poppler-utils unzip
     if ! gem list zsteg -i &>/dev/null; then
         log_info "Installing zsteg gem..."
         if ! sudo gem install zsteg; then
@@ -256,7 +261,8 @@ step_rsactftool() {
     if command -v RsaCtfTool &>/dev/null || [ -f /usr/local/bin/RsaCtfTool ]; then
         log_info "Already installed."; return 0
     fi
-    install_apt_packages python3-venv python3-pip libgmp3-dev libmpc-dev
+    # libgmp3-dev / libmpc-dev are guaranteed by step_build_prereqs.
+    install_apt_packages python3-venv python3-pip
     mkdir -p "$INSTALL_DIR"
     if [ ! -d "$INSTALL_DIR/RsaCtfTool/.git" ]; then
         if ! git clone "$RSACTFTOOL_REPO" "$INSTALL_DIR/RsaCtfTool"; then
@@ -348,10 +354,8 @@ step_python_gaps() {
 
 step_apt_gaps() {
     log_info "--- Apt gaps ---"
-    # sonic-visualiser is included explicitly: metapackages alone don't guarantee it.
-    # cmake is needed by some pip packages (e.g. stegoveritas deps) and the
-    # original stegdetect JPEG scanner build.
-    install_apt_packages tshark wireshark default-jre sonic-visualiser cmake || return 1
+    # cmake is guaranteed by step_build_prereqs.
+    install_apt_packages tshark wireshark default-jre sonic-visualiser || return 1
     if command -v wireshark &>/dev/null && ! groups "$USER" | grep -qw wireshark; then
         log_info "Adding $USER to wireshark group..."
         sudo usermod -aG wireshark "$USER" || log_failure "wireshark-group" "usermod-failed" "failed"
@@ -441,13 +445,14 @@ fi
 log_info "Tip: 's'+Enter = skip step, any other key+Enter = show progress."
 echo ""
 
-run_step "Kali metapackages" step_metapackages || true
-run_step "StegDetect"       step_stegdetect   || true
-run_step "RsaCtfTool"       step_rsactftool   || true
-run_step "CyberChef"        step_cyberchef    || true
-run_step "Python gaps"      step_python_gaps  || true
-run_step "Apt gaps"         step_apt_gaps     || true
-run_step "GUI downloads"    step_gui_downloads || true
+run_step "Build prerequisites" step_build_prereqs  || true
+run_step "Kali metapackages"  step_metapackages   || true
+run_step "StegDetect"         step_stegdetect     || true
+run_step "RsaCtfTool"         step_rsactftool     || true
+run_step "CyberChef"          step_cyberchef      || true
+run_step "Python gaps"        step_python_gaps    || true
+run_step "Apt gaps"           step_apt_gaps       || true
+run_step "GUI downloads"      step_gui_downloads  || true
 
 # ==========================================
 # Recap
