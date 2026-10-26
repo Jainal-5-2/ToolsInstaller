@@ -30,10 +30,10 @@ declare -a SKIPPED_STEPS=()
 declare -a OK_STEPS=()
 
 log_failure() {
-    local step="$1" reason="$2"
+    local step="$1" reason="$2" status="${3:-failed}"
     local ts
     ts=$(date '+%Y-%m-%d %H:%M:%S')
-    echo "[$ts] STEP=$step REASON=$reason" >> "$FAIL_LOG"
+    echo "[$ts] STATUS=$status STEP=$step REASON=$reason" >> "$FAIL_LOG"
 }
 
 if ! grep -qi 'kali' /etc/os-release 2>/dev/null; then
@@ -129,7 +129,7 @@ run_step() {
                 kill_tree "$STEP_PID" KILL
                 wait "$STEP_PID" 2>/dev/null || true
                 SKIPPED_STEPS+=("$step_name")
-                log_failure "$step_name" "skipped-by-user"
+                log_failure "$step_name" "skipped-by-user" "skipped"
                 log_warn "Step skipped: $step_name"
                 return 1
             else
@@ -143,7 +143,7 @@ run_step() {
     local elapsed=$(( $(date +%s) - STEP_START ))
     if [ $rc -ne 0 ]; then
         FAILED_STEPS+=("$step_name (exit $rc)")
-        log_failure "$step_name" "exit-code-$rc"
+        log_failure "$step_name" "exit-code-$rc" "failed"
         log_error "Step failed: $step_name (exit $rc, ${elapsed}s)"
         return 1
     fi
@@ -153,6 +153,41 @@ run_step() {
 }
 
 trap 'log_warn "Ctrl-C caught ? skipping current step..."; [[ -n "$STEP_PID" ]] && kill_tree "$STEP_PID" TERM' INT
+
+# ==========================================
+# Verification helper
+# ==========================================
+# print_check KIND TARGET LABEL [HINT]
+# KIND: cmd | file | exe | dir | py
+print_check() {
+    local kind="$1" target="$2" label="$3" hint="${4:-}"
+    local found=0
+    case "$kind" in
+        cmd)  command -v "$target" &>/dev/null && found=1 ;;
+        file) [ -s "$target" ] && found=1 ;;
+        exe)  [ -x "$target" ] && found=1 ;;
+        dir)  [ -d "$target" ] && found=1 ;;
+        py)   python3 -c "import $target" &>/dev/null && found=1 ;;
+    esac
+    local display="${hint:-$target}"
+    if [ $found -eq 1 ]; then
+        printf "  ${GREEN}[OK]${NC}      %-18s %s\n" "$label" "$display"
+    else
+        printf "  ${RED}[MISSING]${NC} %-18s %s\n" "$label" "$display"
+    fi
+}
+
+# ==========================================
+# pip with PEP 668 fallback
+# ==========================================
+pip_install_user() {
+    local pkg="$1"
+    if pip3 install --user "$pkg" &>/dev/null; then return 0; fi
+    log_warn "pip install $pkg (--user) failed; retrying with --break-system-packages"
+    if pip3 install --user --break-system-packages "$pkg" &>/dev/null; then return 0; fi
+    log_failure "$pkg" "pip-failed" "failed"
+    return 1
+}
 
 # ==========================================
 # Step implementations
@@ -167,7 +202,7 @@ install_apt_packages() {
         if ! sudo apt-get install -y "${to_install[@]}" 2>&1 | tee /tmp/apt-step.log; then
             local tail
             tail=$(tail -5 /tmp/apt-step.log | tr '\n' '|')
-            log_failure "apt:${to_install[*]}" "apt-failed: $tail"
+            log_failure "apt:${to_install[*]}" "apt-failed: $tail" "failed"
             rm -f /tmp/apt-step.log
             return 1
         fi
@@ -188,19 +223,22 @@ step_stegdetect() {
     if command -v stegdetect &>/dev/null; then
         log_info "Already installed: $(command -v stegdetect)"; return 0
     fi
+    # Full dependency set from the LikeNmuFF/stegdetect README,
+    # plus cmake for the JPEG scanner source build.
     install_apt_packages file binutils python3 libimage-exiftool-perl \
-                         zbar-tools stegsnow mediainfo sox binwalk steghide ruby wget
+                         zbar-tools stegsnow mediainfo sox binwalk steghide ruby wget \
+                         tesseract-ocr ffmpeg poppler-utils unzip cmake
     if ! gem list zsteg -i &>/dev/null; then
         log_info "Installing zsteg gem..."
         if ! sudo gem install zsteg; then
-            log_failure "zsteg" "gem-install-failed"
+            log_failure "zsteg" "gem-install-failed" "failed"
             return 1
         fi
     fi
     mkdir -p "$INSTALL_DIR"
     if [ ! -d "$INSTALL_DIR/stegdetect/.git" ]; then
         if ! git clone "$STEGDETECT_REPO" "$INSTALL_DIR/stegdetect"; then
-            log_failure "stegdetect-repo" "git-clone-failed"
+            log_failure "stegdetect-repo" "git-clone-failed" "failed"
             return 1
         fi
     fi
@@ -208,7 +246,7 @@ step_stegdetect() {
     git pull --ff-only 2>/dev/null || true
     chmod +x stegdetect.sh
     if ! sudo ./stegdetect.sh --install; then
-        log_failure "stegdetect-install" "script-install-failed"
+        log_failure "stegdetect-install" "script-install-failed" "failed"
         return 1
     fi
 }
@@ -222,7 +260,7 @@ step_rsactftool() {
     mkdir -p "$INSTALL_DIR"
     if [ ! -d "$INSTALL_DIR/RsaCtfTool/.git" ]; then
         if ! git clone "$RSACTFTOOL_REPO" "$INSTALL_DIR/RsaCtfTool"; then
-            log_failure "rsactftool-repo" "git-clone-failed"
+            log_failure "rsactftool-repo" "git-clone-failed" "failed"
             return 1
         fi
     fi
@@ -231,7 +269,7 @@ step_rsactftool() {
     [ -d venv ] || python3 -m venv venv
     source venv/bin/activate
     if ! pip install -e .; then
-        log_failure "rsactftool-pip" "pip-install-failed"
+        log_failure "rsactftool-pip" "pip-install-failed" "failed"
         deactivate
         return 1
     fi
@@ -245,7 +283,7 @@ step_rsactftool() {
         if [ -f "$candidate" ]; then entry="$candidate"; break; fi
     done
     if [ -z "$entry" ]; then
-        log_failure "rsactftool-entry" "entry-point-not-found"
+        log_failure "rsactftool-entry" "entry-point-not-found" "failed"
         log_error "Could not locate RsaCtfTool entry point."
         return 1
     fi
@@ -258,7 +296,7 @@ EOF
     sudo chmod +x /usr/local/bin/RsaCtfTool
 
     if ! RsaCtfTool --help &>/dev/null; then
-        log_failure "rsactftool-wrapper" "verification-failed"
+        log_failure "rsactftool-wrapper" "verification-failed" "failed"
         log_error "RsaCtfTool wrapper exists but 'RsaCtfTool --help' failed."
         return 1
     fi
@@ -275,20 +313,20 @@ step_cyberchef() {
     local zip_url
     zip_url=$(curl -s "$CYBERCHEF_API" | grep browser_download_url | grep '\.zip"' | head -1 | cut -d '"' -f 4)
     if [ -z "$zip_url" ]; then
-        log_failure "cyberchef" "github-api-failed"
+        log_failure "cyberchef" "github-api-failed" "failed"
         log_error "GitHub API rate-limited or unreachable."; return 1
     fi
     log_info "Downloading CyberChef..."
     if ! wget --show-progress --progress=bar:force:noscroll \
               "$zip_url" -O /tmp/cyberchef.zip; then
-        log_failure "cyberchef" "download-failed: $zip_url"
+        log_failure "cyberchef" "download-failed: $zip_url" "failed"
         return 1
     fi
     unzip -o /tmp/cyberchef.zip -d "$dir"
     local src
     src=$(find "$dir" -maxdepth 1 -name 'CyberChef_*.html' | head -1)
     if [ -z "$src" ]; then
-        log_failure "cyberchef" "html-not-found-after-unzip"
+        log_failure "cyberchef" "html-not-found-after-unzip" "failed"
         rm -f /tmp/cyberchef.zip
         return 1
     fi
@@ -299,27 +337,24 @@ step_cyberchef() {
 step_python_gaps() {
     log_info "--- Python supplements ---"
     local failed=0
-    if ! pip3 show volatility3 &>/dev/null; then
-        pip3 install --user volatility3 || { log_failure "volatility3" "pip-failed"; failed=1; }
-    fi
-    if ! pip3 show stegoveritas &>/dev/null; then
-        pip3 install --user stegoveritas || { log_failure "stegoveritas" "pip-failed"; failed=1; }
-    fi
-    if ! pip3 show cyberchef-py &>/dev/null; then
-        pip3 install --user cyberchef-py || { log_failure "cyberchef-py" "pip-failed"; failed=1; }
-    fi
-    python3 -c "import pwn" 2>/dev/null || pip3 install --user pwntools || { log_failure "pwntools" "pip-failed"; failed=1; }
-    python3 -c "import Crypto" 2>/dev/null || pip3 install --user pycryptodome || { log_failure "pycryptodome" "pip-failed"; failed=1; }
-    python3 -c "import z3" 2>/dev/null || pip3 install --user z3-solver || { log_failure "z3-solver" "pip-failed"; failed=1; }
+    pip3 show volatility3 &>/dev/null  || pip_install_user volatility3  || failed=1
+    pip3 show stegoveritas &>/dev/null || pip_install_user stegoveritas || failed=1
+    pip3 show cyberchef-py &>/dev/null || pip_install_user cyberchef-py || failed=1
+    python3 -c "import pwn" 2>/dev/null    || pip_install_user pwntools    || failed=1
+    python3 -c "import Crypto" 2>/dev/null || pip_install_user pycryptodome || failed=1
+    python3 -c "import z3" 2>/dev/null     || pip_install_user z3-solver   || failed=1
     return $failed
 }
 
 step_apt_gaps() {
     log_info "--- Apt gaps ---"
-    install_apt_packages tshark wireshark default-jre || return 1
+    # sonic-visualiser is included explicitly: metapackages alone don't guarantee it.
+    # cmake is needed by some pip packages (e.g. stegoveritas deps) and the
+    # original stegdetect JPEG scanner build.
+    install_apt_packages tshark wireshark default-jre sonic-visualiser cmake || return 1
     if command -v wireshark &>/dev/null && ! groups "$USER" | grep -qw wireshark; then
         log_info "Adding $USER to wireshark group..."
-        sudo usermod -aG wireshark "$USER" || log_failure "wireshark-group" "usermod-failed"
+        sudo usermod -aG wireshark "$USER" || log_failure "wireshark-group" "usermod-failed" "failed"
         log_warn "Log out and back in for capture permission to apply."
     fi
 }
@@ -334,7 +369,7 @@ step_gui_downloads() {
         if ! wget --show-progress --progress=bar:force:noscroll \
                   -O "$jar" \
                   "https://github.com/zardus/ctf-tools/raw/master/stegsolve/stegsolve.jar"; then
-            log_failure "stegsolve" "download-failed"
+            log_failure "stegsolve" "download-failed" "failed"
         fi
     fi
 
@@ -343,7 +378,7 @@ step_gui_downloads() {
         url=$(curl -s https://api.github.com/repos/NationalSecurityAgency/ghidra/releases/latest \
             | grep browser_download_url | grep '\.zip"' | head -1 | cut -d '"' -f 4)
         if [ -z "$url" ]; then
-            log_failure "ghidra" "github-api-failed"
+            log_failure "ghidra" "github-api-failed" "failed"
             return 0
         fi
 
@@ -366,7 +401,7 @@ step_gui_downloads() {
                     log_error "Download stalled at ${cur_mb}MB for 60s ? aborting."
                     kill "$wget_pid" 2>/dev/null || true
                     wait "$wget_pid" 2>/dev/null || true
-                    log_failure "ghidra" "download-stalled-at-${cur_mb}MB"
+                    log_failure "ghidra" "download-stalled-at-${cur_mb}MB" "failed"
                     return 0
                 fi
             else
@@ -378,11 +413,11 @@ step_gui_downloads() {
         wait "$wget_pid"
         local rc=$?
         if [ $rc -ne 0 ]; then
-            log_failure "ghidra" "download-failed-exit-$rc"
+            log_failure "ghidra" "download-failed-exit-$rc" "failed"
             return 0
         fi
         if ! unzip -t /tmp/ghidra.zip >/dev/null 2>&1; then
-            log_failure "ghidra" "downloaded-file-is-not-a-valid-zip"
+            log_failure "ghidra" "downloaded-file-is-not-a-valid-zip" "failed"
             rm -f /tmp/ghidra.zip
             return 0
         fi
@@ -400,7 +435,7 @@ step_gui_downloads() {
 # ==========================================
 log_info "Updating package lists..."
 if ! sudo apt-get update -y; then
-    log_failure "apt-update" "apt-get-update-failed"
+    log_failure "apt-update" "apt-get-update-failed" "failed"
 fi
 
 log_info "Tip: 's'+Enter = skip step, any other key+Enter = show progress."
@@ -415,7 +450,7 @@ run_step "Apt gaps"         step_apt_gaps     || true
 run_step "GUI downloads"    step_gui_downloads || true
 
 # ==========================================
-# Recap (ASCII markers only)
+# Recap
 # ==========================================
 CYBERCHEF_HTML="$INSTALL_DIR/cyberchef/CyberChef.html"
 STEGSOLVE_JAR="$INSTALL_DIR/stegsolve.jar"
@@ -440,21 +475,39 @@ fi
 if [ -s "$FAIL_LOG" ]; then
     echo ""
     log_warn "Failure log: $FAIL_LOG"
-    echo "  Re-run the script to retry only failed/skipped steps (idempotent)."
+    recent_fails=$(grep 'STATUS=failed' "$FAIL_LOG" | tail -10)
+    if [ -n "$recent_fails" ]; then
+        echo "  Recent failed components:"
+        echo "$recent_fails" | sed 's/^/    /'
+    fi
 fi
 
+# ==========================================
+# Verified tool summary
+# ==========================================
+echo ""
+echo -e "${BOLD}--- Installed tools (verified) ---${NC}"
 echo ""
 echo "GUI:"
-echo "  CyberChef:        file://$CYBERCHEF_HTML"
-echo "  StegSolve:        java -jar $STEGSOLVE_JAR"
-echo "  Wireshark:        wireshark"
-echo "  Ghidra:           $GHIDRA_DIR/ghidraRun"
-echo "  Sonic Visualiser: sonic-visualiser"
+print_check file "$CYBERCHEF_HTML"            "CyberChef"          "file://$CYBERCHEF_HTML"
+print_check file "$STEGSOLVE_JAR"             "StegSolve"          "java -jar $STEGSOLVE_JAR"
+print_check cmd  wireshark                    "Wireshark"          "wireshark"
+print_check exe  "$GHIDRA_DIR/ghidraRun"      "Ghidra"             "$GHIDRA_DIR/ghidraRun"
+print_check cmd  sonic-visualiser             "Sonic Visualiser"   "sonic-visualiser"
 echo ""
 echo "CLI:"
-echo "  vol -f <dump> windows.info   (Volatility 3)"
-echo "  RsaCtfTool --help"
-echo "  stegdetect --version"
-echo "  tshark -r <pcap>"
+print_check cmd  vol                          "Volatility 3"       "vol -f <dump> windows.info"
+print_check cmd  RsaCtfTool                   "RsaCtfTool"         "RsaCtfTool --help"
+print_check cmd  stegdetect                   "StegDetect"         "stegdetect --version"
+print_check cmd  tshark                       "tshark"             "tshark -r <pcap>"
+print_check cmd  stegoveritas                 "stegoveritas"       "stegoveritas <image>"
+print_check cmd  cmake                        "cmake"              "cmake --version"
+echo ""
+echo "Python modules:"
+print_check py   pychef                       "cyberchef-py"       "import pychef"
+print_check py   pwn                          "pwntools"           "import pwn"
+print_check py   Crypto                       "pycryptodome"       "import Crypto"
+print_check py   z3                           "z3-solver"          "import z3"
+
 echo ""
 echo "If Wireshark was just added to your group: log out and back in."
