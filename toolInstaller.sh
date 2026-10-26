@@ -15,6 +15,7 @@ INSTALL_DIR="$HOME/ctf-tools"
 STEGDETECT_REPO="https://github.com/LikeNmuFF/stegdetect.git"
 RSACTFTOOL_REPO="https://github.com/RsaCtfTool/RsaCtfTool.git"
 CYBERCHEF_API="https://api.github.com/repos/gchq/CyberChef/releases/latest"
+GHIDRA_API="https://api.github.com/repos/NationalSecurityAgency/ghidra/releases/latest"
 FAIL_LOG="$INSTALL_DIR/install-failures.log"
 
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'
@@ -176,6 +177,33 @@ print_check() {
 }
 
 # ==========================================
+# HTTP helpers (status-checked downloads)
+# ==========================================
+url_ok() {
+    local url="$1" code
+    code=$(curl -sL -o /dev/null -w '%{http_code}' "$url" 2>/dev/null || echo "000")
+    [ "$code" = "200" ]
+}
+
+fetch_progress() {
+    local url="$1" dest="$2" tmp
+    tmp="$(mktemp)"
+    if ! url_ok "$url"; then
+        log_warn "HTTP status != 200 for $url ? skipping download"
+        rm -f "$tmp"
+        return 1
+    fi
+    if ! wget --show-progress --progress=bar:force:noscroll \
+              --tries=3 --timeout=30 -O "$tmp" "$url"; then
+        log_warn "Download failed for $url"
+        rm -f "$tmp"
+        return 1
+    fi
+    mv "$tmp" "$dest"
+    return 0
+}
+
+# ==========================================
 # pip with PEP 668 fallback
 # ==========================================
 pip_install_user() {
@@ -212,7 +240,6 @@ install_apt_packages() {
 
 step_build_prereqs() {
     log_info "--- Build prerequisites ---"
-    # Must run before any pip/compile step so native extensions can build.
     install_apt_packages cmake build-essential pkg-config python3-dev \
                          libgmp3-dev libmpc-dev
 }
@@ -228,8 +255,6 @@ step_stegdetect() {
     if command -v stegdetect &>/dev/null; then
         log_info "Already installed: $(command -v stegdetect)"; return 0
     fi
-    # Full dependency set from the LikeNmuFF/stegdetect README.
-    # cmake is guaranteed by step_build_prereqs.
     install_apt_packages file binutils python3 libimage-exiftool-perl \
                          zbar-tools stegsnow mediainfo sox binwalk steghide ruby wget \
                          tesseract-ocr ffmpeg poppler-utils unzip
@@ -261,7 +286,6 @@ step_rsactftool() {
     if command -v RsaCtfTool &>/dev/null || [ -f /usr/local/bin/RsaCtfTool ]; then
         log_info "Already installed."; return 0
     fi
-    # libgmp3-dev / libmpc-dev are guaranteed by step_build_prereqs.
     install_apt_packages python3-venv python3-pip
     mkdir -p "$INSTALL_DIR"
     if [ ! -d "$INSTALL_DIR/RsaCtfTool/.git" ]; then
@@ -323,8 +347,7 @@ step_cyberchef() {
         log_error "GitHub API rate-limited or unreachable."; return 1
     fi
     log_info "Downloading CyberChef..."
-    if ! wget --show-progress --progress=bar:force:noscroll \
-              "$zip_url" -O /tmp/cyberchef.zip; then
+    if ! fetch_progress "$zip_url" /tmp/cyberchef.zip; then
         log_failure "cyberchef" "download-failed: $zip_url" "failed"
         return 1
     fi
@@ -341,20 +364,38 @@ step_cyberchef() {
 }
 
 step_python_gaps() {
-    log_info "--- Python supplements ---"
+    log_info "--- Python supplements (pipx + venv) ---"
     local failed=0
-    pip3 show volatility3 &>/dev/null  || pip_install_user volatility3  || failed=1
-    pip3 show stegoveritas &>/dev/null || pip_install_user stegoveritas || failed=1
-    pip3 show cyberchef-py &>/dev/null || pip_install_user cyberchef-py || failed=1
-    python3 -c "import pwn" 2>/dev/null    || pip_install_user pwntools    || failed=1
-    python3 -c "import Crypto" 2>/dev/null || pip_install_user pycryptodome || failed=1
-    python3 -c "import z3" 2>/dev/null     || pip_install_user z3-solver   || failed=1
+
+    install_apt_packages pipx || { log_failure "pipx" "apt-install-failed" "failed"; return 1; }
+    pipx ensurepath &>/dev/null || true
+
+    pipx list 2>/dev/null | grep -q 'volatility3' || pipx install volatility3 || { log_failure "volatility3" "pipx-failed" "failed"; failed=1; }
+    pipx list 2>/dev/null | grep -q 'stegoveritas' || pipx install stegoveritas || { log_failure "stegoveritas" "pipx-failed" "failed"; failed=1; }
+    pipx list 2>/dev/null | grep -q 'pwntools'     || pipx install pwntools     || { log_failure "pwntools-cli" "pipx-failed" "failed"; failed=1; }
+
+    if command -v stegoveritas_install_deps &>/dev/null; then
+        stegoveritas_install_deps &>/dev/null || log_warn "stegoveritas_install_deps had warnings"
+    fi
+
+    local venv="$HOME/ctf-venv"
+    if [ ! -d "$venv" ]; then
+        python3 -m venv "$venv" || { log_failure "ctf-venv" "venv-create-failed" "failed"; failed=1; }
+    fi
+    if [ -d "$venv" ]; then
+        source "$venv/bin/activate"
+        python3 -c "import pwn" 2>/dev/null || pip install pwntools || { log_failure "pwntools-venv" "pip-failed" "failed"; failed=1; }
+        python3 -c "import Crypto" 2>/dev/null || pip install pycryptodome || { log_failure "pycryptodome-venv" "pip-failed" "failed"; failed=1; }
+        python3 -c "import z3" 2>/dev/null || pip install z3-solver || { log_failure "z3-venv" "pip-failed" "failed"; failed=1; }
+        python3 -c "import pychef" 2>/dev/null || pip install cyberchef-py || { log_failure "cyberchef-py-venv" "pip-failed" "failed"; failed=1; }
+        deactivate
+    fi
+
     return $failed
 }
 
 step_apt_gaps() {
     log_info "--- Apt gaps ---"
-    # cmake is guaranteed by step_build_prereqs.
     install_apt_packages tshark wireshark default-jre sonic-visualiser || return 1
     if command -v wireshark &>/dev/null && ! groups "$USER" | grep -qw wireshark; then
         log_info "Adding $USER to wireshark group..."
@@ -366,72 +407,94 @@ step_apt_gaps() {
 step_gui_downloads() {
     log_info "--- GUI downloads ---"
     mkdir -p "$INSTALL_DIR"
-    local jar="$INSTALL_DIR/stegsolve.jar" gdir="$INSTALL_DIR/ghidra"
+    local jar="$INSTALL_DIR/stegsolve.jar"
 
     if [ ! -f "$jar" ]; then
-        log_info "Downloading StegSolve (small, ~50KB)..."
-        if ! wget --show-progress --progress=bar:force:noscroll \
-                  -O "$jar" \
-                  "https://github.com/zardus/ctf-tools/raw/master/stegsolve/stegsolve.jar"; then
+        log_info "Downloading StegSolve..."
+        if ! fetch_progress \
+             "https://github.com/eugenekolo/sec-tools/raw/master/stego/stegsolve/stegsolve/stegsolve.jar" \
+             "$jar"; then
             log_failure "stegsolve" "download-failed" "failed"
         fi
     fi
 
-    if [ ! -d "$gdir" ]; then
-        local url
-        url=$(curl -s https://api.github.com/repos/NationalSecurityAgency/ghidra/releases/latest \
-            | grep browser_download_url | grep '\.zip"' | head -1 | cut -d '"' -f 4)
-        if [ -z "$url" ]; then
-            log_failure "ghidra" "github-api-failed" "failed"
-            return 0
-        fi
-
-        log_info "Downloading Ghidra (~400MB, this can take several minutes)..."
-        log_info "URL: $url"
-
-        wget -c --show-progress --progress=bar:force:noscroll \
-             -O /tmp/ghidra.zip "$url" &
-        local wget_pid=$!
-
-        local last_size=0 stall_count=0
-        while kill -0 "$wget_pid" 2>/dev/null; do
-            sleep 5
-            local cur_size
-            cur_size=$(stat -c%s /tmp/ghidra.zip 2>/dev/null || echo 0)
-            local cur_mb=$((cur_size / 1048576))
-            if [ "$cur_size" -eq "$last_size" ]; then
-                stall_count=$((stall_count + 1))
-                if [ $stall_count -ge 12 ]; then
-                    log_error "Download stalled at ${cur_mb}MB for 60s ? aborting."
-                    kill "$wget_pid" 2>/dev/null || true
-                    wait "$wget_pid" 2>/dev/null || true
-                    log_failure "ghidra" "download-stalled-at-${cur_mb}MB" "failed"
-                    return 0
-                fi
-            else
-                stall_count=0
-                last_size="$cur_size"
-                log_info "Downloading... ${cur_mb}MB so far"
-            fi
-        done
-        wait "$wget_pid"
-        local rc=$?
-        if [ $rc -ne 0 ]; then
-            log_failure "ghidra" "download-failed-exit-$rc" "failed"
-            return 0
-        fi
-        if ! unzip -t /tmp/ghidra.zip >/dev/null 2>&1; then
-            log_failure "ghidra" "downloaded-file-is-not-a-valid-zip" "failed"
-            rm -f /tmp/ghidra.zip
-            return 0
-        fi
-        mkdir -p "$gdir"
-        unzip -o /tmp/ghidra.zip -d "$gdir" --strip-components=1 2>/dev/null || \
-            unzip -o /tmp/ghidra.zip -d "$gdir"
-        rm -f /tmp/ghidra.zip
-        chmod +x "$gdir/ghidraRun" 2>/dev/null || true
-        log_info "Ghidra extracted to: $gdir"
+    # Ghidra: skip if ghidraRun already exists anywhere under INSTALL_DIR
+    local existing_run
+    existing_run=$(find "$INSTALL_DIR" -maxdepth 3 -name ghidraRun -type f 2>/dev/null | head -1)
+    if [ -n "$existing_run" ]; then
+        log_info "Ghidra already present: $existing_run"
+        return 0
     fi
+
+    local url
+    url=$(curl -s "$GHIDRA_API" \
+        | grep browser_download_url | grep '\.zip"' | head -1 | cut -d '"' -f 4)
+    if [ -z "$url" ]; then
+        log_failure "ghidra" "github-api-failed" "failed"
+        return 0
+    fi
+
+    if ! url_ok "$url"; then
+        log_failure "ghidra" "http-status-not-200: $url" "failed"
+        return 0
+    fi
+
+    log_info "Downloading Ghidra (~400MB, this can take several minutes)..."
+    log_info "URL: $url"
+
+    wget -c --show-progress --progress=bar:force:noscroll \
+         --tries=3 --timeout=30 -O /tmp/ghidra.zip "$url" &
+    local wget_pid=$!
+
+    local last_size=0 stall_count=0
+    while kill -0 "$wget_pid" 2>/dev/null; do
+        sleep 5
+        local cur_size
+        cur_size=$(stat -c%s /tmp/ghidra.zip 2>/dev/null || echo 0)
+        local cur_mb=$((cur_size / 1048576))
+        if [ "$cur_size" -eq "$last_size" ]; then
+            stall_count=$((stall_count + 1))
+            if [ $stall_count -ge 12 ]; then
+                log_error "Download stalled at ${cur_mb}MB for 60s ? aborting."
+                kill "$wget_pid" 2>/dev/null || true
+                wait "$wget_pid" 2>/dev/null || true
+                log_failure "ghidra" "download-stalled-at-${cur_mb}MB" "failed"
+                rm -f /tmp/ghidra.zip
+                return 0
+            fi
+        else
+            stall_count=0
+            last_size="$cur_size"
+            log_info "Downloading... ${cur_mb}MB so far"
+        fi
+    done
+    wait "$wget_pid"
+    local rc=$?
+    if [ $rc -ne 0 ]; then
+        log_failure "ghidra" "download-failed-exit-$rc" "failed"
+        rm -f /tmp/ghidra.zip
+        return 0
+    fi
+    if ! unzip -t /tmp/ghidra.zip >/dev/null 2>&1; then
+        log_failure "ghidra" "downloaded-file-is-not-a-valid-zip" "failed"
+        rm -f /tmp/ghidra.zip
+        return 0
+    fi
+
+    # Extract WITHOUT --strip-components so the archive's own top-level
+    # directory is preserved, then locate ghidraRun dynamically.
+    log_info "Extracting Ghidra..."
+    unzip -o /tmp/ghidra.zip -d "$INSTALL_DIR"
+    rm -f /tmp/ghidra.zip
+
+    local ghidra_run
+    ghidra_run=$(find "$INSTALL_DIR" -maxdepth 3 -name ghidraRun -type f 2>/dev/null | head -1)
+    if [ -z "$ghidra_run" ]; then
+        log_failure "ghidra" "ghidraRun-not-found-after-extract" "failed"
+        return 0
+    fi
+    chmod +x "$ghidra_run" 2>/dev/null || true
+    log_info "Ghidra launcher: $ghidra_run"
 }
 
 # ==========================================
@@ -455,11 +518,11 @@ run_step "Apt gaps"           step_apt_gaps       || true
 run_step "GUI downloads"      step_gui_downloads  || true
 
 # ==========================================
-# Recap
+# Recap ? resolve paths dynamically for the summary
 # ==========================================
 CYBERCHEF_HTML="$INSTALL_DIR/cyberchef/CyberChef.html"
 STEGSOLVE_JAR="$INSTALL_DIR/stegsolve.jar"
-GHIDRA_DIR="$INSTALL_DIR/ghidra"
+GHIDRA_RUN=$(find "$INSTALL_DIR" -maxdepth 3 -name ghidraRun -type f 2>/dev/null | head -1)
 
 echo ""
 log_info "--- Done ---"
@@ -497,7 +560,11 @@ echo "GUI:"
 print_check file "$CYBERCHEF_HTML"            "CyberChef"          "file://$CYBERCHEF_HTML"
 print_check file "$STEGSOLVE_JAR"             "StegSolve"          "java -jar $STEGSOLVE_JAR"
 print_check cmd  wireshark                    "Wireshark"          "wireshark"
-print_check exe  "$GHIDRA_DIR/ghidraRun"      "Ghidra"             "$GHIDRA_DIR/ghidraRun"
+if [ -n "$GHIDRA_RUN" ]; then
+    print_check exe "$GHIDRA_RUN"             "Ghidra"             "$GHIDRA_RUN"
+else
+    print_check exe "$INSTALL_DIR/ghidra/ghidraRun" "Ghidra"       "not found under $INSTALL_DIR"
+fi
 print_check cmd  sonic-visualiser             "Sonic Visualiser"   "sonic-visualiser"
 echo ""
 echo "CLI:"
@@ -508,11 +575,25 @@ print_check cmd  tshark                       "tshark"             "tshark -r <p
 print_check cmd  stegoveritas                 "stegoveritas"       "stegoveritas <image>"
 print_check cmd  cmake                        "cmake"              "cmake --version"
 echo ""
-echo "Python modules:"
-print_check py   pychef                       "cyberchef-py"       "import pychef"
-print_check py   pwn                          "pwntools"           "import pwn"
-print_check py   Crypto                       "pycryptodome"       "import Crypto"
-print_check py   z3                           "z3-solver"          "import z3"
+echo "Python modules (ctf-venv):"
+VENV_PY="$HOME/ctf-venv/bin/python"
+if [ -x "$VENV_PY" ]; then
+    for mod in pychef pwn Crypto z3; do
+        case "$mod" in
+            pychef) name="cyberchef-py" ;;
+            pwn)    name="pwntools" ;;
+            Crypto) name="pycryptodome" ;;
+            z3)     name="z3-solver" ;;
+        esac
+        if "$VENV_PY" -c "import $mod" &>/dev/null; then
+            printf "  ${GREEN}[OK]${NC}      %-18s import %s (in ctf-venv)\n" "$name" "$mod"
+        else
+            printf "  ${RED}[MISSING]${NC} %-18s import %s (in ctf-venv)\n" "$name" "$mod"
+        fi
+    done
+else
+    echo "  ${RED}[MISSING]${NC} ctf-venv         $HOME/ctf-venv not found"
+fi
 
 echo ""
 echo "If Wireshark was just added to your group: log out and back in."
