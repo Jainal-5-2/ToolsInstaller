@@ -103,7 +103,6 @@ install_apt_packages() {
     done
     if [ ${#to_install[@]} -gt 0 ]; then
         log_info "Installing: ${to_install[*]}"
-        # Capture apt output; on failure, tee the last lines into the log
         if ! sudo apt-get install -y "${to_install[@]}" 2>&1 | tee /tmp/apt-step.log; then
             local tail
             tail=$(tail -5 /tmp/apt-step.log | tr '\n' '|')
